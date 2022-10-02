@@ -1,0 +1,283 @@
+---
+title: "initial_analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(readr)
+library(knitr)
+library(ggplot2)
+library(RColorBrewer)
+library(ggsci)
+library(cowplot)
+library(stringdist)
+#library(biomaRt)
+library(scales)
+library(tidyverse)
+library(matrixStats)
+library("ggvenn")
+library(gtools)
+library(parallel)
+library(purrr)
+
+rm(list=ls())
+
+opts_knit$set(root.dir ='/ru-auth/local/home/lzhao/Data_scratch/Khodursky/sexbias_var/')
+
+```
+
+Compile results from all tissues. Based on the output of the gamlss analysis. This is needed for all further analysis
+in this project.
+
+```{r}
+
+
+runtable <- read_delim('v8_phenotype_files/phs000424.v8.pht002743.v8.p2.c1.GTEx_Sample_Attributes.GRU.txt', 
+                       delim = '\t' , col_types = cols(SMNOTES = col_character(), SMGTC = col_character()) )
+
+tissues <- gsub(" ", "", unique(runtable$SMTSD))
+# exclude tissues that are sex-specific or have other issues
+#tissues <- tissues[!(tissues %in% c("Brain-FrontalCortex(BA9)", "Ovary", "Uterus", "Vagina","Bladder", #"Prostate", "Testis","FallopianTube","Kidney-Medulla","Cervix-Ectocervix","Cervix-Endocervix",
+#                                  "Cells-Leukemiacellline(CML)"))]
+tissues <- tissues[!(tissues %in% c("Brain-FrontalCortex(BA9)", "Ovary", "Uterus", "Vagina","Bladder", "Prostate", "Testis","FallopianTube","Kidney-Medulla","Cervix-Ectocervix","Cervix-Endocervix",
+                                  "Cells-Leukemiacellline(CML)"))]
+
+
+# load biomart info from file instead of using biomaRt
+biomart_info <- read_csv('biomart_info_042221.csv')
+
+load_res_tis <- function(tis, biomart_info) {
+  # load initial results pre-permutaion
+  df <- read.csv(paste0('gamlss_out/', tis, '_simple_initial_PC_test.csv'),
+                 stringsAsFactors = FALSE) %>%
+    mutate(gene_id = gsub("\\..*", "", gene_id),
+           padj.sig = p.adjust(p.sig, method = "BH"), 
+           padj.mu = p.adjust(p.mu, method = "BH")) # remove
+  
+  # load permutation empirical p values
+  # adjust empirical p values using BH. not sure if necessary
+  empp <- read.csv(paste0('gamlss_out/', tis, '_empp_beta_PC_test.csv'),
+                   stringsAsFactors = FALSE) %>%
+    mutate(padj = p.adjust(empp, method = "BH"),
+           gene_id = gsub("\\..*", "", gene_id))
+  
+  
+  
+  # genes which fail the permutation test are considered insignificant
+  perm_failed <- empp %>%
+    filter(padj > 0.05) %>%
+    pull(gene_id)
+  # merge biotype/chromosome location with 
+  df <- df %>%
+    merge(biomart_info, by = "gene_id") %>%
+    filter((chromosome_name != 'Y'))  %>% 
+    mutate(tissue = tis,
+           bias = recode(bias, 
+                         male = "male high var." , 
+                         female = "female high var.") ,
+           bias = if_else((padj.sig > 0.05) | (gene_id %in% perm_failed), 'not SDV', bias),  # change insignificant genes to "not SDV"
+           meta_bias = recode(bias, `male high var.` = "SDV", `female high var.` = "SDV"),   # meta bias without sex labels
+           perm_results = if_else(gene_id %in% perm_failed, "not significant", 
+                                  if_else(padj.sig < 0.05, "significant", "NA")))  # include permutation results
+  
+  return(df)
+}
+gamlss_out <- map_dfr(tissues, load_res_tis, biomart_info = biomart_info)
+
+```
+
+
+Now plot the number of genes found in each tissue as a bar plot 
+
+```{r}
+
+# SDV genes
+sig <- gamlss_out %>% 
+  filter(meta_bias == 'SDV') %>%
+  mutate(bias = factor(bias, levels = c("male high var.", "female high var.")),
+         tissue = gsub('-',': ', tissue))
+  
+
+plot_count <- ggplot(sig, aes(bias,fill=bias)) +
+  geom_bar()+
+  coord_flip() + 
+  facet_grid(rows=vars(tissue)) + theme_classic()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.y = element_text(angle=0),
+        plot.margin = unit(c(25, 25,25, 25), "pt"))  + 
+  scale_fill_d3() + 
+  scale_y_continuous(trans=scales::pseudo_log_trans(base = 10),
+                                        breaks=c(0, 1, 10, 100, 1000))
+write.csv(gamlss_out, 'gamlss_sum/gamlss_out_PC.csv', quote = F, row.names = F)
+ggsave('plots/counts_bar_lrt.pdf', plot_count, height = 11, width = 8)
+
+```
+
+
+Plot the expression patterns for select genes. Part of this is to quality control and part of this is to generate examples.
+```{r}
+
+
+
+plot_gene <- function(tissue, gene){
+  
+  cpm_df <- read.csv(paste0('cpm/', tissue, '.csv'), row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
+  rownames(cpm_df) <- gsub("\\..*","",rownames(cpm_df))
+  gene_cpm <- cpm_df %>% filter(rownames(cpm_df) == gene)
+  gene_cpm <- data.frame(SUBJID = colnames(gene_cpm), cpm = as.numeric(gene_cpm))
+  pheno <- read_delim('v8_phenotype_files/phs000424.v8.pht002742.v8.p2.c1.GTEx_Subject_Phenotypes.GRU.txt',delim = '\t') %>% 
+  dplyr::select(SUBJID,AGE,RACE,SEX)
+  pheno$SEX[pheno$SEX == 1] <- "male"
+  pheno$SEX[pheno$SEX == 2] <- "female"
+  gene_cpm <- merge(pheno, gene_cpm, by = "SUBJID") %>% filter(RACE == 3)
+  plot <- ggplot(gene_cpm, aes(x=cpm, y=SEX, color=SEX)) + 
+    geom_violin() + 
+    geom_point(color='black', alpha=0.3) + 
+    theme_classic() + 
+    scale_color_manual(values = pal_d3("category10", alpha = 1)(10)[4:5]) + 
+    ggtitle(paste0(tissue, ':', gene)) + 
+    ylab('') + 
+    theme(legend.position = "none", plot.title = element_text(size=12))
+  return(plot)
+  
+}
+plota <- plot_gene("Pituitary", "ENSG00000162552")
+plotb <- plot_gene("Breast-MammaryTissue","ENSG00000172243")
+plot_example <- plot_grid(plota, plotb, nrow = 2)
+plot_example <- plot_grid(NULL, plot_example, nrow = 2, labels = c('A','C'), rel_heights = c(1.3, 1))
+plot_fig1 <- plot_grid(plot_example, plot_count, labels = c('','B'), ncol = 2, rel_widths = c(1, 1.7)) 
+
+#ggsave('plots/sample_exp.pdf', plot, height=4, width=4)
+ggsave('plots/figure1.pdf', plot_fig1, height=11, width = 11)
+```
+
+
+
+
+function for turning p values into text
+```{r}
+p2text <- function(p) {
+ if (p <= 0.05) {
+   p <- format(signif(p, 2), scientific = TRUE)
+  return(paste0('p=',p))
+  
+   } else {
+    return('')
+  }
+
+}
+
+```
+
+Compare TPMs and CPMs of SDV vs non SDV genes
+```{r}
+# only plot genes with at least 10 SDV genes
+tissues_10 <-  gamlss_out %>% 
+    group_by(tissue) %>% 
+    filter(meta_bias == 'SDV') %>%
+    summarize(n=n()) %>%
+    filter(( n >= 10)) %>%
+    pull(tissue)
+gamlss_out_10 <- gamlss_out %>%
+  filter(tissue %in% tissues_10)
+
+
+test_exp <- function(tis, gamlss_out){
+  exp_tis <- gamlss_out %>% filter(tissue == tis)
+  p <- wilcox.test(exp_tis$cpm[exp_tis$meta_bias == 'SDV'],
+                  exp_tis$cpm[(exp_tis$meta_bias == 'not SDV')])$p.value
+     
+  out <- data.frame(p = p, tissue = tis)
+  
+  return(out)
+
+}
+
+exp_sig <- map_dfr(tissues_10, test_exp, gamlss_out=gamlss_out_10) %>% 
+  mutate(padj = p.adjust(p, method = "BH"),
+         sig = map_chr(padj, p2text))
+
+
+
+annotate <- data.frame(tissue = exp_sig$tissue, sig = exp_sig$sig, meta_bias = "SDV")
+annotate$y <- -.5
+
+plot_cpm <- ggplot(gamlss_out_10, aes(x=meta_bias, y=log(cpm), color=meta_bias)) + 
+  geom_text(data=annotate, aes(x = meta_bias, y = 12, label = sig),
+            size=2.5, color = "black") + 
+  coord_flip() + 
+  facet_wrap(tissue~., ncol = 4) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_boxplot(width=0.1)+ 
+  scale_color_jama() +
+  ylim(-1,13.5) + xlab('') + 
+  theme(text = element_text(size=9), legend.position = "none")
+ggsave2('plots/exp_levels_supfig1A.pdf', plot_cpm, height = 12, width = 10) 
+
+
+
+```
+
+
+
+get TPM expression patterns of these genes
+```{r}
+
+tpm <- read_delim("TPM/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_median_tpm.gct", delim='\t') %>%
+  mutate(Description = NULL,
+         Name =  gsub("\\..*", "", Name))
+colnames(tpm) <- gsub(' ','',colnames(tpm))
+get_tpm <- function(gene, tis){
+ out <- tpm %>%
+   filter(Name==gene)
+ if(dim(out)[1]>1){
+   return(sum(out[,tis]))
+ }else{
+ return(as.numeric(out[,tis]))
+ }
+}
+gene_tpms <- map2_dbl(gamlss_out_10$gene_id, gamlss_out_10$tissue, get_tpm)
+
+gamlss_out_10$tpm <- gene_tpms
+
+test_exp <- function(tis, gamlss_out){
+  exp_tis <- gamlss_out %>% filter(tissue == tis)
+  p <- wilcox.test(exp_tis$tpm[exp_tis$meta_bias == 'SDV'],
+                  exp_tis$tpm[(exp_tis$meta_bias == 'not SDV')])$p.value
+     
+  out <- data.frame(p = p, tissue = tis)
+  
+  return(out)
+
+}
+
+exp_sig <- map_dfr(tissues_10, test_exp, gamlss_out=gamlss_out_10) %>% 
+  mutate(padj = p.adjust(p, method = "BH"),
+         sig = map_chr(padj, p2text))
+
+
+
+annotate <- data.frame(tissue=exp_sig$tissue,sig=exp_sig$sig, meta_bias="SDV")
+annotate$y <- -.5
+
+plot_tpm <- ggplot(gamlss_out_10, aes(x=meta_bias, y=log(tpm), color=meta_bias)) + 
+  geom_text(data=annotate, aes(x = meta_bias, y = 12, label = sig),
+            size=2.5, color = "black") + 
+  coord_flip() + 
+  facet_wrap(tissue~., ncol = 4) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_boxplot(width=0.1)+ 
+  scale_color_jama() +
+  ylim(-3,16) + xlab('') + 
+  theme(text = element_text(size=9), legend.position = "none")
+ggsave2('plots/exp_levels_supfig1B.pdf', plot_tpm, height = 12, width = 10) 
+
+```
+
