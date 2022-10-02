@@ -1,0 +1,491 @@
+---
+title: "Power_analysis"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(gamlss)
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(edgeR)
+library(gamlss)
+#library(stringdist)
+#library(gtools)
+#library(biomaRt)
+library(parallel)
+library(matrixStats)
+library(ggplot2)
+library(lawstat)
+library(npsm)
+rm(list=ls())
+```
+
+```{r}
+source('outlier_removal.R')
+source('gamlss_funcs.R')
+```
+
+
+
+
+This is a simplified GAMLSS function that is used for simulations.
+
+
+
+```{r}
+
+
+fit_gamlss_sim <- function(vec_male, 
+                           vec_female, 
+                           offset_male=NULL, 
+                           offset_female=NULL) {
+  if (!(is.null(offset_male) | is.null(offset_female))){
+     dat <- rbind(data.frame(sex = "male",
+                          y = vec_male, 
+                          ofs = offset_male), 
+               data.frame(sex = "female", 
+                          y = vec_female, 
+                          ofs = offset_female))
+    form_m0_mu <- formula("y ~ sex  + offset(ofs)")
+    form_m0_sig <- formula(" ~ sex")
+    form_m1_sig <- formula(" ~ 1")
+    form_m2_mu <- formula("y ~   offset(ofs)")
+  }else{
+     dat <- rbind(data.frame(sex = "male",
+                          y = vec_male), 
+               data.frame(sex = "female", 
+                          y = vec_female))
+    form_m0_mu <- formula("y ~ sex")
+    form_m0_sig <- formula(" ~ sex")
+    form_m1_sig <- formula(" ~ 1")
+    form_m2_mu <- formula("y ~  1")
+  }
+  
+    
+  # to assist in the fitting, identify starting point for sigma by fitting
+  # simple model without sigma parameterized first
+  fit_mean_m0 <- gamlss(fo = form_m0_mu,
+                        data = dat,
+                        family = NBI(), n.cyc = 5000, trace = F)
+  
+  s.start_m0 = as.numeric(fitted(fit_mean_m0,"sigma")[1])
+  # similarly identify starting point for sigma for model 2
+  fit_mean_m2 <- gamlss(fo = form_m2_mu,
+                        data = dat,
+                        family = NBI(), n.cyc = 5000, trace = F)
+  
+  s.start_m2 = as.numeric(fitted(fit_mean_m2,"sigma")[1])
+  
+  # fit model m0: The most complex model including all terms
+  m0 <- tryCatch(
+    gamlss(fo = form_m0_mu, 
+           sigma.fo = form_m0_sig , data=dat,
+           family = NBI(), sigma.start = s.start_m0, n.cyc = 5000, trace = F),
+    warning= function(w) NULL, error= function(e) NULL
+  )
+  
+  # fit model m1: Reduced model excluding sex from the sigma parameterization 
+  m1 <- tryCatch(
+    gamlss(fo =form_m0_mu, 
+           sigma.fo = form_m1_sig, data=dat,
+           family = NBI(), sigma.start = s.start_m0, n.cyc = 5000, trace = F),
+    warning= function(w) NULL, error= function(e) NULL
+  )
+  # 
+  # fit model 2: Reduced model excluding sex from the mu parameterization. 
+  # Using all terms for sigma
+  m2 <- tryCatch(
+    gamlss(fo = form_m2_mu, 
+           sigma.fo = form_m0_sig, data=dat,
+           family = NBI(), sigma.start = s.start_m2, n.cyc = 5000, trace = F),
+    warning= function(w) NULL, error= function(e) NULL
+  )
+  # results dataframe
+  res <- data.frame(
+    coef.male.sig = NA,
+    coef.male.mu = NA,
+    p.sig = NA,
+    p.mu = NA,
+    cpm = NA,
+    bias = NA,
+    mu = NA,
+    sig = NA,
+    mean_cts = NA
+  )
+  
+  # Only consider genes where all models could be fit properly
+  if(!any(sapply(list(m0,m1,m2), is.null)))
+  {
+    print(m0$sigma.coefficients)
+    res$coef.male.sig <- m0$sigma.coefficients[[2]]
+    res$coef.male.mu <- m0$mu.coefficients[[2]]
+   
+    res$mu <- m0$mu.coefficients[[1]]
+    res$sig <- m0$sigma.coefficients[[1]]
+    res$bias <- 'male'
+    res$mean_cts <- mean(dat$y)
+    
+    if(m0$sigma.coefficients[[2]]<0){
+      res$bias <- 'female'
+    }
+    
+    # likelihood ratio tests
+     tryCatch({res$p.sig = LR.test(m1, m0, print = FALSE)$p.val},
+             warning= function(w) NULL, error= function(e) NULL
+    )
+    tryCatch({res$p.mu = LR.test(m2, m0, print = FALSE)$p.val},
+             warning= function(w) NULL, error= function(e) NULL
+    )
+    
+  }
+  return(res)
+}
+
+
+```
+
+
+Estimate effect sizes observed in real count data
+
+```{r}
+
+
+
+
+fit_gamlss_gene <- function(i, Counts_edgeR){
+  male_counts <- Counts_edgeR$counts[i, Counts_edgeR$samples$sex == "male"]
+  female_counts <- Counts_edgeR$counts[i, Counts_edgeR$samples$sex == "female"]
+  offset_male <- Counts_edgeR$samples$offset[Counts_edgeR$samples$sex == "male"]
+  offset_female <- Counts_edgeR$samples$offset[Counts_edgeR$samples$sex == "female"]
+  fit_gamlss_sim(male_counts, female_counts, offset_male, offset_female)
+}
+
+fit_gamlss_tissue <- function(counts_file, save_file){
+  counts <- as.data.frame(read_csv(counts_file))
+  colnames(counts)[1] <- "gene_id"
+  rownames(counts) <- counts$gene_id
+  
+  runtable <- read_delim('../v8_phenotype_files/phs000424.v8.pht002743.v8.p2.c1.GTEx_Sample_Attributes.GRU.txt',
+                         delim = '\t' )
+  
+  biomart_info <- read.csv('../biomart_info_042221.csv', stringsAsFactors = F)
+  pheno <- read_delim('../v8_phenotype_files/phs000424.v8.pht002742.v8.p2.c1.GTEx_Subject_Phenotypes.GRU.txt',
+                        delim = '\t') %>% 
+      dplyr::select(SUBJID, AGE, RACE, SEX)
+  pheno$SEX[pheno$SEX == 1] <- "male"
+  pheno$SEX[pheno$SEX == 2] <- "female"
+
+  person_run <- runtable %>% 
+      dplyr::select(SAMPID, SMTSD, SMRIN, SMTSISCH, SMAFRZE) %>% 
+      mutate(SMTSD = gsub(" ","",SMTSD), 
+             SUBJID = sub("^([^-]+-[^-]+).*", "\\1", SAMPID)) %>% 
+    filter(SAMPID %in% colnames(counts)) %>%
+    merge(pheno, by = "SUBJID") %>%
+    filter(RACE == 3) # only leave caucasian indivi
+
+
+    
+
+  Counts_edgeR <- process_counts(counts, person_run, biomart_info)
+  gene_i <- seq_along(Counts_edgeR$counts[,1])
+  gamlss_out <- mclapply(gene_i, fit_gamlss_gene, Counts_edgeR=Counts_edgeR, mc.cores = 12)
+  gamlss_out <- do.call(rbind, gamlss_out) 
+  gamlss_out$gene_id <- rownames(Counts_edgeR$counts)
+  write.csv(gamlss_out, save_file)
+}
+
+fit_gamlss_tissue('../count_tables/Breast-MammaryTissue.csv', '../power_analysis/Breast_effect_sizes_test.csv')
+fit_gamlss_tissue('../count_tables/AdrenalGland.csv', '../power_analysis/Adrenal_effect_sizes_test.csv')
+fit_gamlss_tissue('../count_tables/Adipose-Subcutaneous.csv', '../power_analysis/Adipose_sub_effect_sizes_test.csv')
+
+```
+
+
+
+```{r}
+
+gamlss_adrenal <- read.csv('../power_analysis/Adrenal_effect_sizes_test.csv') %>% mutate(tissue = "Adrenal")
+
+gamlss_adip <- read.csv('../power_analysis/Adipose_sub_effect_sizes_test.csv') %>% mutate(tissue = "Adipose\n(subcut.)")
+
+gamlss_breast <- read.csv('../power_analysis/Breast_effect_sizes_test.csv') %>% mutate(tissue = "Breast")
+
+
+plot_tissuefx <- function(gamlss_df){
+  plot_effect <- gamlss_df %>% 
+    dplyr::select(sig, coef.male.sig, tissue) %>% 
+    mutate(sigma = ifelse(coef.male.sig<0, sig + coef.male.sig, sig),
+           delta_sigma = abs(coef.male.sig)) %>%
+    ggplot(aes(sigma, delta_sigma)) + 
+    facet_grid(. ~ tissue) + 
+    geom_bin_2d() + 
+    ylab(expression(paste(Delta, ln(sigma)))) + 
+    xlab(expression(ln(sigma))) +  
+    theme_classic() 
+  return(plot_effect)
+}
+
+fx_plot <-  plot_tissuefx(rbind(gamlss_adip, gamlss_adrenal, gamlss_breast))
+fx_plot
+
+```
+
+
+
+```{r}
+#library(car)
+
+
+
+
+gen_NB_samp <- function(n,
+                        mu,
+                        sigma,
+                        delta_sigma, 
+                        imbalance=1){
+theta_male <- 1/exp(sigma + delta_sigma)
+theta_female <- 1/exp(sigma)
+males <- rnegbin((n*imbalance)/(imbalance + 1), mu = mu, theta = theta_male)
+
+females <- rnegbin(n/(imbalance + 1), mu = mu, theta = theta_female)
+
+return(list(males, females))  
+}
+
+runsim_gamlss <- function(n,
+                         mu, 
+                         sigma, 
+                         delta_sigma, imbalance){
+
+  nb_samp <- gen_NB_samp(n, mu, sigma, delta_sigma)
+  fit <- fit_gamlss_sim(nb_samp[[1]], nb_samp[[2]])
+  p <- fit$p.sig
+  #sig <- fit$sig
+  return(p)
+  
+}
+
+runsim_fk <- function(n,
+                         mu, 
+                         sigma, 
+                         delta_sigma, imbalance){
+  nb_samp <- gen_NB_samp(n, mu, sigma, delta_sigma, imbalance)
+  dat <- rbind(data.frame(sex = factor("male"),
+                          y = log(nb_samp[[1]] + 1)), 
+               data.frame(sex = factor("female"), 
+                          y = log(nb_samp[[2]] + 1)))
+  #fit <- fk.test(y ~ sex, dat)
+  fit <- fk.test(nb_samp[[1]], nb_samp[[2]])
+  p <- fit$p.value
+  return(p)
+  
+}
+
+runsim_lev <- function(n,
+                         mu, 
+                         sigma, 
+                         delta_sigma, imbalance){
+  nb_samp <- gen_NB_samp(n, mu, sigma, delta_sigma, imbalance)
+  dat <- rbind(data.frame(sex = factor("male"),
+                          y = log(nb_samp[[1]] + 1)), 
+               data.frame(sex = factor("female"), 
+                          y = log(nb_samp[[2]] + 1)))
+  #fit <- leveneTest(y ~ sex, dat)
+  #p <- fit$`Pr(>F)`[[1]]
+  fit <- levene.test(dat$y, dat$sex)
+  p <- fit$p.value
+  return(p)
+  
+}
+
+power <- function(pvals){
+  return(sum(pvals <= 0.05)/length(pvals))
+}
+
+
+
+
+
+get_power <- function(n, sigma, delta_sigma, mu, simfunc, nsims, imbalance){
+  out <- replicate(nsims, simfunc(n, 
+                              mu, 
+                              sigma, 
+                              delta_sigma, imbalance)) %>% power()
+  return(out)
+  
+}
+```
+Run simulation study
+Balanced group sizes
+
+```{r}
+
+
+# population size
+
+n<- c(400)
+
+sigmas <- c(-4, -3, -2, -1, 0, 1)
+
+delta_sigmas <- c(0, 0.1, 0.2, 0.3, 0.4, 0.5)
+
+
+param_df <- expand.grid(n = n, sigma = sigmas, delta_sigma = delta_sigmas)
+
+set.seed(6)
+lev_power <- pmap_dbl(as.list(param_df), get_power, simfunc = runsim_lev, mu=1500, nsims=1000, imbalance=1)
+set.seed(6)
+gamlss_power <- pmap_dbl(as.list(param_df), get_power, simfunc = runsim_gamlss, mu=1500, nsims=1000, imbalance=1)
+set.seed(6)
+fk_power <- pmap_dbl(as.list(param_df), get_power, simfunc = runsim_fk, mu=1500, nsims=1000, imbalance=1)
+
+
+
+power_df <- rbind(param_df %>% mutate(power = gamlss_power, 
+                                    test = 'GAMLSS'),
+                  param_df %>% mutate(power = lev_power, 
+                                    test = 'Lev'), 
+                  param_df %>% mutate(power = fk_power, 
+                                    test = 'FK'))
+
+write.csv(power_df, '../power_analysis/power_equalgroups_log_test.csv')
+                  
+```
+
+
+
+
+
+```{r}
+
+
+power_df <- read.csv('../power_analysis/power_equalgroups_log_test.csv')
+
+plot_power_eq <- ggplot(power_df %>% filter(delta_sigma>0), 
+                      aes(sigma, delta_sigma, fill= power)) +
+   facet_grid(. ~ test , scales = "free") + 
+  geom_tile() +
+  ylab(expression(paste(Delta, ln(sigma)))) + 
+  xlab(expression(ln(sigma))) +  
+  scale_x_continuous(breaks=seq(-4, 1), labels=c("-4", '', "-2", '', "0", '')) +  
+  theme_classic() + 
+  ggtitle('Equal group sizes')
+
+plot_power_eq
+#ggsave('../plots_PC/power_equalgroups.pdf', plot_power_eq, height=4, width = 6)
+```
+
+
+
+
+
+```{r}
+power_df <- read.csv('../power_analysis/power_equalgroups_log_test.csv')
+plot_fpr_eq <- ggplot(power_df %>% filter(delta_sigma == 0), 
+                      aes(sigma, power)) +
+   facet_grid(. ~ test , scales = "free") + 
+  geom_col() +
+  ylab('FPR') + 
+  xlab(expression(ln(sigma))) +  
+  theme_classic()+ 
+  scale_x_continuous(breaks=seq(-4, 1)) + 
+  ggtitle('Equal group sizes') +
+  geom_hline(yintercept=0.05, color='firebrick', linetype='dotted')
+ 
+plot_fpr_eq
+#ggsave('../plots_PC/FPR_equalgroups.pdf', plot_fpr_eq, height=4, width = 6)
+```
+Run simulation study
+Imbalanced group sizes
+
+```{r}
+
+#sample_sizes <- seq(50, 500, 50)
+
+n<- c(400)
+
+sigmas <- c(-4, -3, -2, -1, 0, 1)
+
+delta_sigmas <- seq(-.5, 0.5, 0.1)
+
+
+
+param_df <- expand.grid(n = n, sigma = sigmas, delta_sigma = delta_sigmas)
+
+set.seed(6)
+lev_power <- pmap_dbl(as.list(param_df), get_power, simfunc = runsim_lev, mu=1500, nsims=1000, imbalance=4)
+set.seed(6)
+gamlss_power <- pmap_dbl(as.list(param_df), get_power, simfunc = runsim_gamlss, mu=1500, nsims=1000, imbalance=4)
+set.seed(6)
+fk_power <- pmap_dbl(as.list(param_df), get_power, simfunc = runsim_fk, mu=1500, nsims=1000, imbalance=4)
+
+
+
+power_df <- rbind(param_df %>% mutate(power = gamlss_power, 
+                                    test = 'GAMLSS'),
+                  param_df %>% mutate(power = lev_power, 
+                                    test = 'Lev'), 
+                  param_df %>% mutate(power = fk_power, 
+                                    test = 'FK'))
+
+write.csv(power_df, '../power_analysis/power_unequalgroups_log_test.csv')
+                  
+```
+
+
+```{r}
+power_df <- read.csv('../power_analysis/power_unequalgroups_log_test.csv')
+
+plot_power_neq <- ggplot(power_df %>% filter(delta_sigma != 0), 
+                      aes(sigma, delta_sigma, fill= power)) +
+   facet_grid(. ~ test , scales = "free") + 
+  geom_tile() +
+  ylab(expression(paste(Delta, ln(sigma)))) + 
+  xlab(expression(ln(sigma))) +  
+  theme_classic() +  
+  scale_y_continuous(breaks=seq(-0.5, 0.5, 0.1)) + 
+  scale_x_continuous(breaks=seq(-4, 1), labels=c("-4", '', "-2", '', "0", '')) + 
+  ggtitle('Unequal group sizes')
+plot_power_neq
+#ggsave('../plots_PC/power_unequalgroups.pdf', plot_power_neq, height=8, width = 6)
+
+
+
+```
+```{r}
+
+plot_fpr_neq <- ggplot(power_df %>% filter(delta_sigma == 0), 
+                      aes(sigma, power)) +
+   facet_grid(. ~ test , scales = "free") + 
+  geom_col() +
+  ylab('FPR') + 
+  xlab(expression(ln(sigma))) +  
+  theme_classic() +  
+  ggtitle('Unequal group sizes') + 
+  scale_x_continuous(breaks=seq(-4, 1))+
+  geom_hline(yintercept=0.05, color='firebrick', linetype='dotted')
+plot_fpr_neq
+#ggsave('../plots_PC/FPR_unequalgroups.pdf', plot_fpr_neq, height=4, width = 6)
+```
+
+```{r}
+library(cowplot)
+
+#row1 <- plot_grid(adipose_effect, adrenal_effect, breast_effect, nrow=1)
+# plot_left <- plot_grid(fx_plot, plot_fpr_eq, plot_fpr_neq, labels=c('A', 'C', 'E'), nrow=3)
+# plot_right <- plot_grid(plot_power_eq, plot_power_neq, labels=c('B', 'D'), nrow=2, rel_heights = c(1, 2))
+# plot_total <- plot_grid(plot_left, plot_right, ncol=2)
+
+
+
+plot_left <- plot_grid(plot_power_eq, plot_power_neq, labels=c('A', 'C'),  rel_heights = c(1, 2), nrow=2)
+plot_right <- plot_grid(plot_fpr_eq, plot_fpr_neq, fx_plot, labels=c('B', 'D', 'E'), nrow=3)
+plot_total <- plot_grid(plot_left, plot_right, ncol=2)
+plot_total
+ggsave('../plots/PowerAnalysisTotal.pdf', plot_total, height=8, width = 8)
+```
+
+

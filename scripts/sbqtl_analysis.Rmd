@@ -1,0 +1,58 @@
+---
+title: "sbqtl_analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(fgsea)
+library(tidyverse)
+rm(list=ls())
+
+knitr::opts_knit$set(root.dir ='/ru-auth/local/home/lzhao/Data_scratch/Khodursky/sexbias_var/')
+
+
+```
+
+Main GSEA analysis (supplementary figure 8)
+
+```{r}
+
+g <- read_csv('gamlss_sum/gamlss_out_PC.csv') %>% filter(tissue == "Breast-MammaryTissue")
+sbq <- read_table('GTEx_Analysis_v8_sbeQTLs/GTEx_Analysis_v8_sbeQTLs.txt') %>% 
+  filter(Tissue == "Breast_Mammary_Tissue") %>%
+  mutate(gene_id = gsub("\\..*", "", ensembl_gene_id)) %>%
+  merge(g, by = "gene_id") #%>%
+  #filter(pvals.corrected <= 1)
+sdv <- sbq %>% filter(meta_bias == 'SDV') %>% pull(gene_id)
+sdvl <- list(sdv)
+names(sdvl) <- c("SDV")
+ranks <- sbq #%>% arrange(pval_nominal_sb*numtested)
+
+#ranks_v <- -log10(ranks$pval_nominal_sb * ranks$numtested)
+ranks_v <- -log10(ranks$pvals.corrected)
+names(ranks_v) <- ranks$gene_id
+set.seed(1)
+fgseaRes <- fgsea(pathways = sdvl, 
+                  stats    = ranks_v,
+                  eps      = 0.0,
+                  minSize  = 15,
+                  maxSize  = 1000,
+                  scoreType = "pos")
+
+plotEnrichment(sdvl[["SDV"]],
+               ranks_v) + labs(title="SDV")
+ggsave('plots/GSEA_sbqtl.pdf', width = 7, height = 5)
+
+```
+
+Enrichment of genes with larger eQTL effect sizes in males relative to the set of all genes with significant sbQTLs 
+
+```{r}
+sig_sbqtl <-  sbq %>% filter(qval < 0.25)
+total_number_sbeqtl <- sig_sbqtl %>% pull(gene_id) %>% length()
+male_sdv<- sig_sbqtl %>% filter(bias == 'male high var.')
+male_sdv_hslope <- sum(abs(male_sdv$slope_m) > abs(male_sdv$slope_f))
+male_hslope <- sum(abs(sig_sbqtl$slope_m) > abs(sig_sbqtl$slope_f))
+1-phyper(male_sdv_hslope-1, male_hslope, total_number_sbeqtl - male_hslope, dim(male_sdv)[1])
+
+```

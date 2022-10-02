@@ -1,0 +1,112 @@
+---
+title: "replication_summary"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(readr)
+library(edgeR)
+library(gamlss)
+library(stringdist)
+library(gtools)
+#library(biomaRt)
+library(parallel)
+library(matrixStats)
+library(purrr)
+library(ggplot2)
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+opts_knit$set(root.dir ='/ru-auth/local/home/lzhao/Data_scratch/Khodursky/sexbias_var/')
+
+```
+
+Load permutation data
+```{r}
+#Breast-MammaryTissue
+base_fnamei <- 'gamlss_rep/Breast-MammaryTissue_initial0.7_'
+base_fnamer <- 'gamlss_rep/Breast-MammaryTissue_replication0.7_'
+
+empp_i <- data.frame(empp = c(), gene_id = c())
+empp_r <- data.frame(empp = c(), gene_id = c())
+# data was split into 50 blocks to speed up computation
+for(i in seq(50)){
+  tryCatch(
+  initial_i <- read.csv(paste0(base_fnamei, i, '_empp_repanal_s19.csv')),
+  error = function(e) NULL)
+  
+  empp_i <- rbind(empp_i, initial_i)
+  
+  tryCatch(
+  rep_i <- read.csv(paste0(base_fnamer, i, '_empp_repanal_s19.csv'))
+  , error= function(e) NULL)
+  
+  empp_r <- rbind(empp_r, rep_i)
+  
+}
+```
+
+Load the initial and replication data
+```{r cars}
+# load initial data
+# filter initial data to FDR 0.05 and filter replication data to P value 0.05
+init <- read.csv('gamlss_rep/Breast-MammaryTissue_initial0.7_repanals19_test.csv') %>% filter(padj.sig<0.05)
+empp_i <- empp_i %>% mutate(padj = p.adjust(empp, method="BH")) %>% filter(padj < 0.05)
+init <- init %>% filter(gene_id %in% empp_i$gene_id)
+n_init <- dim(init)[1]
+# load replication data
+rep <- read.csv('gamlss_rep/Breast-MammaryTissue_replication0.7_repanals19_test.csv') %>% filter(p.sig<0.05)
+empp_r <- empp_r  %>% filter(empp < 0.05)
+# this data frame contains all significant genes in replication set
+rep <- rep %>% filter(gene_id %in% empp_r$gene_id)
+
+m <- merge(init, rep, by = "gene_id")
+# observed number of replications
+obs <- sum((m$bias.x == m$bias.y) )
+#
+```
+
+Run permutation test to determine significance of replication
+```{r}
+# reload raw initial and replication data
+init_raw <- read.csv('gamlss_rep/Breast-MammaryTissue_initial0.7_repanals19_test.csv')
+
+set.seed(19)
+rand_rep <- function(i, init_raw, rep, n_init){
+  rsamp <- init_raw[sample(dim(init_raw)[1], n_init),]
+  mr <- merge(rsamp, rep, by="gene_id")
+  # number of "replications" in random sample
+  count <- sum(mr$bias.x == mr$bias.y)
+  return(count)
+  
+}
+
+randr <- map_dbl(seq(10000), 
+                 rand_rep,
+                 init_raw = init_raw,
+                 rep = rep,
+                 n_init = n_init)
+# scaled replication rate
+randr <- randr/n_init
+# observed replication rate
+obs <- obs/n_init
+
+```
+
+Plot results
+
+```{r}
+plot <- ggplot(data.frame(randr = randr), aes(x=randr)) + 
+  geom_histogram(bins = 50 ) + 
+  theme_classic() + 
+  xlim(0, 0.25) +
+  xlab("replication rate") +
+  geom_vline(xintercept = obs, color = "firebrick2") +
+  annotate("text",x = .15, y = 1500,label = "empirical\np<1e-4") 
+plot
+
+ggsave('plots/Breast-replication.pdf', plot, height = 3, width =6)
+
+
+```
