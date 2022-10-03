@@ -41,21 +41,22 @@ pheno$SEX[pheno$SEX == 2] <- "female"
 
 biomart_info <- read.csv('biomart_info_042221.csv', stringsAsFactors = F)
 
-
+file_table <- read.csv('file_table.csv', stringsAsFactors = F)
 # run gamlss on a given tissue. This is the main function that encompasses
 # all of the other functions
-run_diffsexvar <- function(tissue, runtable, pheno, biomart_info){
+run_diffsexvar <- function(tissue, runtable, pheno, biomart_info, file_table){
   print(tissue)
   # load counts table
   counts <- as.data.frame(read_csv(paste0('count_tables/', tissue, '.csv')))
   colnames(counts)[1] <- "gene_id"
   rownames(counts) <- counts$gene_id
   # load covariates
-  cov_files <- list.files('GTEx_Analysis_v8_eQTL_covariates/')
-  cov_file <- cov_files[amatch(paste0(tissue,'v8.covariates.txt'),
-                               cov_files,method='lcs',maxDist=1000)]
-  print(tissue)
-  print(cov_file)
+  # cov_files <- list.files('GTEx_Analysis_v8_eQTL_covariates/')
+  # cov_file <- cov_files[amatch(paste0(tissue,'v8.covariates.txt'),
+  #                              cov_files,method='lcs',maxDist=1000)]
+  cov_file <- file_table$covfile[file_table$tissue == tissue]
+  #print(tissue)
+  #print(cov_file)
   cov <- read.table(paste0('GTEx_Analysis_v8_eQTL_covariates/', cov_file),
                     header = T, check.names = F)
   #cov <- cov %>% filter(ID %in% c('PC1','PC2','PC3','PC4','PC5'))
@@ -74,7 +75,7 @@ run_diffsexvar <- function(tissue, runtable, pheno, biomart_info){
     filter(SAMPID %in% colnames(counts)) %>%
     merge(pheno, by = "SUBJID") %>%
     merge(cov, by = "SUBJID") %>% 
-    filter(RACE == 3) # only leave caucasian individuals
+    filter(RACE == 3) # only leave caucasian individuals to reduce confounding
   
  
   Counts_edgeR <- process_counts(counts, person_run, biomart_info)
@@ -120,4 +121,4 @@ run_diffsexvar <- function(tissue, runtable, pheno, biomart_info){
 }
 
 
-run_diffsexvar(tissue, runtable=runtable,pheno=pheno,  biomart_info = biomart_info)
+run_diffsexvar(tissue, runtable=runtable,pheno=pheno,  biomart_info = biomart_info, file_table = file_table)
